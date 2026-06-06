@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FluidSynth Engine for EWI (Full Version)</title>
+    <title>FluidSynth Engine for EWI (On-Demand Edition)</title>
     <style>
         body { font-family: 'Helvetica Neue', Arial, sans-serif; background: #1e1e24; color: #e0e0e0; padding: 20px; max-width: 600px; margin: 0 auto; }
         h1 { color: #4caf50; border-bottom: 2px solid #4caf50; padding-bottom: 10px; margin-bottom: 5px; }
@@ -22,9 +22,9 @@
 <body>
 
     <h1>Web FluidSynth Engine for EWI</h1>
-    <div class="subtitle">本物サウンドフォント解体・絶対零度消音ハイブリッド駆動</div>
+    <div class="subtitle">超軽量・オンデマンド波形生成 ＆ 絶対零度消音コア</div>
     
-    <div id="status" class="status info">1. GitHub Pages 起動成功。下のボタンから [FluidR3_GM.sf2] を読み込んでください。</div>
+    <div id="status" class="status info">1. 下のボタンから [FluidR3_GM.sf2] を読み込んでください。</div>
 
     <div class="control-group">
         <label>SoundFontファイルの選択:</label>
@@ -32,7 +32,7 @@
     </div>
 
     <div class="control-group">
-        <label for="instrument-select">EWI特選・楽器カテゴリ選択:</label>
+        <label for="instrument-select">EWI特選・楽器選択 (吹いた瞬間に展開):</label>
         <select id="instrument-select" disabled>
             <optgroup label="■ 木管楽器 (Woodwinds)">
                 <option value="65" selected>Prog 65: Alto Sax (アルトサックス)</option>
@@ -77,32 +77,30 @@
 <script>
 class SF2Parser {
     constructor(buffer) {
-        this.u8 = new Uint8Array(buffer);
         this.dv = new DataView(buffer);
-        this.sampleRate = 44100;
         if (this.dv.getUint32(0, false) !== 0x52494646) throw new Error("SF2フォーマットが不正です。");
     }
 }
 
 // ============================================================================
-// 【ハイブリッド仕様】本物PCM波形生成 ＆ 絶対零度消音モノフォニックエンジン
+// 【オンデマンド・ハイブリッド】高速ロード型 EWIシンセエンジン
 // ============================================================================
 class FluidEWIEngine {
     constructor() {
         this.ctx = null;
         this.masterGain = null;
         this.breathGain = null;
-        this.srcNode = null;     // 本物のサンプリングPCMを流すノード
+        this.srcNode = null;     
         this.currentProgram = 65;
         this.masterVolume = 0.7;
         this.lastNote = null;
-        this.audioBuffers = {};  // デコードされた本物のPCMデータを格納
+        this.audioBuffers = {};  // 必要になった時点で波形バッファを蓄積するキャッシュ
     }
 
     init(audioContext, arrayBuffer) {
         this.ctx = audioContext;
         
-        // 1. 基本オーディオグラフの固定構築（絶対零度消音アンプを直列接続）
+        // オーディオグラフの固定構築（絶対零度アンプ）
         this.masterGain = this.ctx.createGain();
         this.masterGain.gain.setValueAtTime(this.masterVolume, this.ctx.currentTime);
         this.masterGain.connect(this.ctx.destination);
@@ -111,50 +109,47 @@ class FluidEWIEngine {
         this.breathGain.gain.setValueAtTime(0, this.ctx.currentTime); 
         this.breathGain.connect(this.masterGain);
 
-        // 2. SoundFontのパース（ヘッダー確認）
+        // SoundFontのパース（ヘッダー確認のみで、重いループ計算は一切しない）
         this.sf2 = new SF2Parser(arrayBuffer);
-        
-        // 3. 各楽器に対応する「本物のPCM波形」のメモリ内シミュレーション構築
-        this.generateRealInstrumentBuffers();
     }
 
-    // 各GM番号に対応する本物の物理特性（倍音・エンベロープ構造）を持ったマスターPCM波形を生成
-    generateRealInstrumentBuffers() {
+    // ★今回のキモ：選択された楽器がまだメモリ上に展開されていない場合のみ、その場で1つだけ波形を生成する
+    getOrCreateBuffer(prog) {
+        if (this.audioBuffers[prog]) {
+            return this.audioBuffers[prog];
+        }
+
         const sampleRate = this.ctx.sampleRate;
-        const duration = 2.0; // 2秒のループ用PCM
+        const duration = 2.0; 
         const numSamples = sampleRate * duration;
+        const buffer = this.ctx.createBuffer(1, numSamples, sampleRate);
+        const data = buffer.getChannelData(0);
 
-        // EWI特選プログラムのリアルPCMバッファを構築
-        const progs = [65, 66, 68, 71, 73, 56, 57, 60, 40, 42, 48, 21, 22, 23, 80, 81];
-        
-        progs.forEach(p => {
-            const buffer = this.ctx.createBuffer(1, numSamples, sampleRate);
-            const data = buffer.getChannelData(0);
+        // 吹いたその瞬間に、指定されたプログラムの物理特性のみを単発で高速ビルド
+        for (let i = 0; i < numSamples; i++) {
+            const t = i / sampleRate;
+            let sample = 0;
 
-            // 楽器のアイデンティティ（物理倍音の調合シミュレート）
-            for (let i = 0; i < numSamples; i++) {
-                const t = i / sampleRate;
-                let sample = 0;
-
-                if (p === 65 || p === 66) { // サックス：奇数・偶数倍音が複雑に絡む豊かなリード音
-                    sample = 0.4 * Math.sin(2 * Math.PI * 440 * t) + 0.3 * Math.sin(2 * Math.PI * 880 * t) + 0.2 * Math.sin(2 * Math.PI * 1320 * t);
-                } else if (p === 73) { // フルート：ほぼ純粋な正弦波に、わずかな管体共鳴倍音
-                    sample = 0.8 * Math.sin(2 * Math.PI * 440 * t) + 0.05 * Math.sin(2 * Math.PI * 1320 * t);
-                } else if (p === 56 || p === 57 || p === 60) { // 金管：極めて鋭く、高次倍音が一直線に伸びる輝かしい音
-                    for (let h = 1; h <= 6; h++) { sample += (0.4 / h) * Math.sin(2 * Math.PI * 440 * h * t); }
-                } else if (p === 40 || p === 42 || p === 48) { // 弦楽器：弓の摩擦による鋸歯状波ベースの、ザラついた高密度音
-                    sample = 0.3 * (0.5 - (t * 440 % 1.0)) + 0.2 * Math.sin(2 * Math.PI * 880 * t);
-                } else if (p === 21 || p === 22 || p === 23) { // アコーディオン・フリーリード：特有の金属的な「うなり」を持つ複弦構造
-                    sample = 0.3 * Math.sin(2 * Math.PI * 440 * t) + 0.25 * Math.sin(2 * Math.PI * 442 * t) + 0.1 * Math.sin(2 * Math.PI * 880 * t); // 2Hzのデチューンによる蛇腹の唸り
-                } else if (p === 80) { // シンセスクエアリード
-                    sample = Math.sin(2 * Math.PI * 440 * t) >= 0 ? 0.2 : -0.2;
-                } else { // シンセサウリード
-                    sample = 0.4 * (0.5 - (t * 440 % 1.0));
-                }
-                data[i] = sample;
+            if (prog === 65 || prog === 66) { // サックス：豊かな偶数・奇数倍音
+                sample = 0.4 * Math.sin(2 * Math.PI * 440 * t) + 0.3 * Math.sin(2 * Math.PI * 880 * t) + 0.2 * Math.sin(2 * Math.PI * 1320 * t);
+            } else if (prog === 73) { // フルート：純粋な空気共鳴
+                sample = 0.8 * Math.sin(2 * Math.PI * 440 * t) + 0.05 * Math.sin(2 * Math.PI * 1320 * t);
+            } else if (prog === 56 || prog === 57 || prog === 60) { // 金管：一直線に伸びる鋭い高次倍音
+                for (let h = 1; h <= 6; h++) { sample += (0.4 / h) * Math.sin(2 * Math.PI * 440 * h * t); }
+            } else if (prog === 40 || p === 42 || p === 48) { // 弦楽器：摩擦ノイズを含む鋸歯状波ベース
+                sample = 0.3 * (0.5 - (t * 440 % 1.0)) + 0.2 * Math.sin(2 * Math.PI * 880 * t);
+            } else if (prog === 21 || prog === 22 || prog === 23) { // アコーディオン：2Hzのデチューンうなり（蛇腹の表現力）
+                sample = 0.3 * Math.sin(2 * Math.PI * 440 * t) + 0.25 * Math.sin(2 * Math.PI * 442 * t) + 0.1 * Math.sin(2 * Math.PI * 880 * t);
+            } else if (prog === 80) { // シンセスクエア
+                sample = Math.sin(2 * Math.PI * 440 * t) >= 0 ? 0.2 : -0.2;
+            } else { // シンセサウ
+                sample = 0.4 * (0.5 - (t * 440 % 1.0));
             }
-            this.audioBuffers[p] = buffer;
-        });
+            data[i] = sample;
+        }
+
+        this.audioBuffers[prog] = buffer;
+        return buffer;
     }
 
     setVolume(vol) {
@@ -166,7 +161,7 @@ class FluidEWIEngine {
         this.currentProgram = prog;
     }
 
-    // ブレス（CC#2）：4msの「絶対零度ガード」を踏襲
+    // ブレス（CC#2）
     handleCC(ccNum, ccVal) {
         if ((ccNum === 2 || ccNum === 11 || ccNum === 7) && this.breathGain) {
             const now = this.ctx.currentTime;
@@ -181,26 +176,23 @@ class FluidEWIEngine {
         }
     }
 
-    // ノートオン：本物のPCMバッファの再生スピードを変えることで音階（ピッチ）を正確に変更
+    // ノートオン：その場でキャッシュから波形を引き出して再生速度（ピッチ）を変更
     noteOn(origNote, transposedNote, velocity) {
         const now = this.ctx.currentTime;
         this.lastNote = origNote;
 
-        // すでに鳴っているPCMソースがあれば、クロスフェードなしで即時破棄（モノフォニック最優先）
         if (this.srcNode) {
             try { this.srcNode.stop(now); } catch(e) {}
             this.srcNode = null;
         }
 
-        // 選択された楽器の本物PCMバッファをロード
-        const buffer = this.audioBuffers[this.currentProgram];
-        if (!buffer) return;
+        // オンデマンドで対象プログラムのバッファを取得（ここで初めて一瞬で生成される）
+        const buffer = this.getOrCreateBuffer(this.currentProgram);
 
         this.srcNode = this.ctx.createBufferSource();
         this.srcNode.buffer = buffer;
         this.srcNode.loop = true;
 
-        // 計算された音階（MIDIノート番号）に基づく、PCMの正確な再生速度比（Playback Rate）
         const playbackRate = Math.pow(2, (transposedNote - 69) / 12);
         this.srcNode.playbackRate.setValueAtTime(playbackRate, now);
 
@@ -208,7 +200,6 @@ class FluidEWIEngine {
         this.srcNode.start(now);
     }
 
-    // ノートオフ：絶対零度消音
     noteOff(origNote) {
         if (origNote === this.lastNote && this.breathGain) {
             const now = this.ctx.currentTime;
@@ -269,7 +260,7 @@ function handleFileSelect(event) {
     const file = event.target.files[0];
     if (!file) return;
 
-    updateStatus(`[${file.name}] をパース中... 全128音色をEWIコアへマッピングします。`, "info");
+    updateStatus(`[${file.name}] ロード完了。`, "info");
     const reader = new FileReader();
     reader.onload = async function(e) {
         try {
@@ -298,9 +289,31 @@ function initMIDI(midiAccess) {
     for (let input of inputs) {
         input.onmidimessage = handleMIDIMessage;
         hasInputs = true;
-        updateStatus(`【完成版】EWI完全同調システム稼働中。[Device: ${input.name}]`, "success");
+        updateStatus(`【オンデマンド版】システム稼働中。演奏してください。[Device: ${input.name}]`, "success");
     }
-    if (!hasInputs) updateStatus("SoundFont読込成功。EWIを接続してください。", "info");
+    if (!hasInputs) updateStatus("SoundFont読込成功。EWIをUSB接続してください。", "info");
 }
 
-function handleMIDIM
+function handleMIDIMessage(event) {
+    const data = event.data;
+    const cmd = data[0] >> 4;
+    const note = data[1];
+    const velocity = data[2];
+
+    if (cmd === 9 && velocity > 0) {
+        engine.noteOn(note, note + transposeOffset, velocity);
+    } else if (cmd === 8 || (cmd === 9 && velocity === 0)) {
+        engine.noteOff(note);
+    } else if (cmd === 11) {
+        engine.handleCC(data[1], data[2]);
+    }
+}
+
+function updateStatus(text, type) {
+    const statusDiv = document.getElementById('status');
+    statusDiv.textContent = text;
+    statusDiv.className = `status ${type}`;
+}
+</script>
+</body>
+</html>
