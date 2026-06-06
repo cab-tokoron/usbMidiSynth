@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Professional EWI Synthesis Engine</title>
+    <title>Zero-Leak EWI Synthesis Engine</title>
     <style>
         body { font-family: 'Helvetica Neue', Arial, sans-serif; background: #1e1e24; color: #e0e0e0; padding: 20px; max-width: 600px; margin: 0 auto; }
         h1 { color: #4caf50; border-bottom: 2px solid #4caf50; padding-bottom: 10px; }
@@ -19,7 +19,7 @@
 <body>
 
     <h1>Web FluidSynth Engine for EWI</h1>
-    <div id="status" class="status success">プロ仕様：常時駆動型モノフォニック・コア（低負荷・高追従モード）</div>
+    <div id="status" class="status success">残響リーク完全遮断モード（絶対零度ゲイン制御）</div>
 
     <div class="control-group">
         <label>FluidR3_GM.sf2 の読み込み:</label>
@@ -48,7 +48,6 @@
     </div>
 
 <script>
-// SF2ダミーパーサー
 class SoundFontParser {
     constructor(arrayBuffer) {
         const dv = new DataView(arrayBuffer);
@@ -57,8 +56,7 @@ class SoundFontParser {
 }
 
 // ============================================================================
-// 【プロ仕様】常時駆動モノフォニック・シンセシス・エンジン
-// ガベージコレクションを発生させず、EWIの運指とブレスをハードウェア直結レベルで処理
+// リーク音完全排除型・常時駆動モノフォニック・エンジン
 // ============================================================================
 class ProfessionalEWIEngine {
     constructor() {
@@ -70,36 +68,32 @@ class ProfessionalEWIEngine {
         
         this.currentProgram = 65;
         this.masterVolume = 0.7;
-        this.isOscRunning = false;
         this.lastNote = null;
     }
 
     init(audioContext, arrayBuffer) {
         this.ctx = audioContext;
         
-        // オーディオグラフの事前固定構築（演奏中のノード生成をゼロにする）
         this.masterGain = this.ctx.createGain();
         this.masterGain.gain.setValueAtTime(this.masterVolume, this.ctx.currentTime);
         this.masterGain.connect(this.ctx.destination);
 
         this.breathGain = this.ctx.createGain();
-        this.breathGain.gain.setValueAtTime(0, this.ctx.currentTime); // 初期値は無音
+        this.breathGain.gain.setValueAtTime(0, this.ctx.currentTime); 
 
         this.filter = this.ctx.createBiquadFilter();
         this.filter.type = 'lowpass';
         this.filter.frequency.setValueAtTime(3200, this.ctx.currentTime);
 
         this.osc = this.ctx.createOscillator();
-        this.osc.type = 'sawtooth'; // デフォルト：サックス系波形
+        this.osc.type = 'sawtooth'; 
         this.osc.frequency.setValueAtTime(440, this.ctx.currentTime);
 
-        // ガラガラ蛇のようにノードを繋ぎ、発振器を「常時回転」状態にする
         this.osc.connect(this.filter);
         this.filter.connect(this.breathGain);
         this.breathGain.connect(this.masterGain);
         
         this.osc.start();
-        this.isOscRunning = true;
         this.sf2 = new SoundFontParser(arrayBuffer);
     }
 
@@ -112,54 +106,61 @@ class ProfessionalEWIEngine {
         this.currentProgram = prog;
         if (!this.osc) return;
         
-        // プリセット切り替えも波形プロパティの変更のみ（超低負荷）
         if (prog === 73) {
-            this.osc.type = 'triangle'; // フルート
+            this.osc.type = 'triangle'; 
             this.filter.frequency.setTargetAtTime(2000, this.ctx.currentTime, 0.01);
         } else if (prog === 81) {
-            this.osc.type = 'square'; // シンセリード
+            this.osc.type = 'square'; 
             this.filter.frequency.setTargetAtTime(4500, this.ctx.currentTime, 0.01);
         } else {
-            this.osc.type = 'sawtooth'; // サックス系
+            this.osc.type = 'sawtooth'; 
             this.filter.frequency.setTargetAtTime(3200, this.ctx.currentTime, 0.01);
         }
     }
 
-    // ブレス（CC#2）制御：常時稼働しているアンプのゲインを一瞬で書き換える
-    // ループもオブジェクト生成もないため、1秒間に何千回呼ばれてもプツプツノイズは100%発生しません
+    // ブレス（CC#2）制御：残響リークを完全にシャットアウトする
     handleCC(ccNum, ccVal) {
         if ((ccNum === 2 || ccNum === 11 || ccNum === 7) && this.breathGain) {
-            const targetGain = (ccVal / 127);
-            // 時定数を0.003秒（3ms）に極小化。プロの高速なタンギング・息の強弱に完全にシンクロ
-            this.breathGain.gain.setTargetAtTime(targetGain, this.ctx.currentTime, 0.003);
+            const now = this.ctx.currentTime;
+
+            // 【核心部分】EWIからの息が完全に止まった、または無音に近い微小値（2以下）になった場合
+            if (ccVal <= 2) {
+                // 指数関数的な漸近を強制キャンセルし、4ミリ秒で「完全な物理的ゼロ」へ直線的に叩き落とす
+                this.breathGain.gain.cancelScheduledValues(now);
+                this.breathGain.gain.setValueAtTime(this.breathGain.gain.value, now);
+                this.breathGain.gain.linearRampToValueAtTime(0, now + 0.004);
+            } else {
+                // 吹いている最中は、3msの時定数で超高速かつ滑らかに追従
+                const targetGain = (ccVal / 127);
+                this.breathGain.gain.setTargetAtTime(targetGain, now, 0.003);
+            }
         }
     }
 
-    // 装飾音・トリル対応：新しいノートが来たら、発振器の周波数を「瞬間移動」させる
     noteOn(origNote, transposedNote, velocity) {
         if (!this.osc) return;
         
         this.lastNote = origNote;
         const freq = 440 * Math.pow(2, (transposedNote - 69) / 12);
         
-        // 0.002秒（2ms）の超微小なグライド（スムージング）を挟むことで、
-        // トリル時のデジタルなクリックノイズを消し去り、本物の管楽器の滑らかなスラーを再現
+        // 2msの微小グライドでトリルを滑らかに
         this.osc.frequency.setTargetAtTime(freq, this.ctx.currentTime, 0.002);
     }
 
-    // EWI側から「指が離れた」とNote Offが届いたときの処理
     noteOff(origNote) {
-        // 現在鳴っている最新のノートに対するOff命令である場合のみ処理
         if (origNote === this.lastNote && this.breathGain) {
-            // 音残りを防ぐため、即座にゲインをゼロに落とす（EWI側のブレス0送信とダブルガード）
-            this.breathGain.gain.setTargetAtTime(0, this.ctx.currentTime, 0.005);
+            const now = this.ctx.currentTime;
+            // 運指が離れた（Note Off）場合も、即座に完全なゼロまで直線的に消音する
+            this.breathGain.gain.cancelScheduledValues(now);
+            this.breathGain.gain.setValueAtTime(this.breathGain.gain.value, now);
+            this.breathGain.gain.linearRampToValueAtTime(0, now + 0.004);
             this.lastNote = null;
         }
     }
 }
 
 // ============================================================================
-// MIDI ルーティング（変更なし・ストレートスルー）
+// MIDI ルーティング（ストレートスルー）
 // ============================================================================
 const engine = new ProfessionalEWIEngine();
 let audioCtx = null;
@@ -207,7 +208,7 @@ function handleFileSelect(event) {
     const file = event.target.files[0];
     if (!file) return;
 
-    updateStatus(`[${file.name}] プロ仕様コアへ展開中...`, "info");
+    updateStatus(`[${file.name}] コアへ最適化ロード中...`, "info");
     const reader = new FileReader();
     reader.onload = async function(e) {
         try {
