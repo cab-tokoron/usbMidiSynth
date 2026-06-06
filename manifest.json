@@ -1,0 +1,21 @@
+{
+  "short_name": "EWI-Synth",
+  "name": "Genuine FluidSynth Engine for EWI",
+  "icons": [
+    {
+      "src": "https://cdn.jsdelivr.net/npm/@wasmer/app-icons@1.0.0/icons/wasmer-32x32.png",
+      "type": "image/png",
+      "sizes": "32x32"
+    },
+    {
+      "src": "https://cdn.jsdelivr.net/npm/@wasmer/app-icons@1.0.0/icons/wasmer-512x512.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ],
+  "start_url": "./index.html",
+  "background_color": "#1e1e24",
+  "theme_color": "#4caf50",
+  "display": "standalone",
+  "orientation": "portrait"
+}
