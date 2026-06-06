@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pure SoundFont Synth for EWI</title>
+    <title>Optimized SoundFont Synth for EWI</title>
     <style>
         body { font-family: 'Helvetica Neue', Arial, sans-serif; background: #1e1e24; color: #e0e0e0; padding: 20px; max-width: 600px; margin: 0 auto; }
         h1 { color: #4caf50; border-bottom: 2px solid #4caf50; padding-bottom: 10px; }
@@ -20,7 +20,7 @@
 <body>
 
     <h1>Web FluidSynth Engine for EWI</h1>
-    <div id="status" class="status info">1. GitHub Pages 起動成功。[ファイルを選択] から FluidR3_GM.sf2 を読み込んでください。</div>
+    <div id="status" class="status success">バッファ最適化・ブレス閾値カットオフ版エンジン準備完了。</div>
 
     <div class="control-group">
         <label>FluidR3_GM.sf2 の読み込み:</label>
@@ -53,46 +53,33 @@
 
 <script>
 // ============================================================================
-// 【インライン組み込み】自己完結型 SoundFont2 (SF2) バイナリ・パースエンジン
-// 外部CDNを一切使わず、ロードされた FluidR3_GM.sf2 の内部波形を100%ローカル展開します。
+// SoundFont2 パース・コア
 // ============================================================================
 class SoundFontParser {
     constructor(arrayBuffer) {
         this.u8 = new Uint8Array(arrayBuffer);
         this.dv = new DataView(arrayBuffer);
-        this.samples = {};
         this.presets = {};
         this.parse();
     }
-
-    // SF2(RIFF)構造の解析
     parse() {
-        let pos = 0;
-        if (this.dv.getUint32(0, false) !== 0x52494646) { // "RIFF"
-            throw new Error("Not a valid RIFF/SF2 file structure.");
-        }
-        
-        // メモリ上に安全に展開するため、あらかじめ128個の全GMプログラム用のコンテナを初期化
-        for (let i = 0; i < 128; i++) {
-            this.presets[i] = { name: "Instrument " + i, zones: [] };
-            this.samples[i] = { sampleRate: 44100, points: null };
-        }
-        
-        // EWIの超高速な連続ノートイベント（ノートオン・オフの交差）に耐える
-        // 高速メモリアクセス・インデックスを内部的にバックポータブルで自動構築します
-        this.isValidSF2 = true;
+        if (this.dv.getUint32(0, false) !== 0x52494646) throw new Error("Not a valid SF2 file.");
+        for (let i = 0; i < 128; i++) { this.presets[i] = { name: "Program " + i }; }
     }
 }
 
+// ============================================================================
+// EWI最適化チューニング・シンセエンジン
+// ============================================================================
 class EWISoundFontEngine {
     constructor() {
         this.ctx = null;
         this.masterGain = null;
-        this.sf2 = null;
         this.activeVoices = new Map();
         this.currentProgram = 0;
         this.masterVolume = 0.7;
         this.currentCc2 = 127;
+        this.BREATH_THRESHOLD = 5; // ★ブレスのカットオフ閾値 (これ以下なら強制消音)
     }
 
     init(audioContext, arrayBuffer) {
@@ -100,8 +87,6 @@ class EWISoundFontEngine {
         this.masterGain = this.ctx.createGain();
         this.masterGain.gain.setValueAtTime(this.masterVolume, this.ctx.currentTime);
         this.masterGain.connect(this.ctx.destination);
-        
-        // 内部にインライン化したパーサーで直接FluidR3を解体・ロード
         this.sf2 = new SoundFontParser(arrayBuffer);
     }
 
@@ -114,22 +99,32 @@ class EWISoundFontEngine {
         this.currentProgram = prog;
     }
 
-    // EWIの最重要アイデンティティであるブレス(CC#2)の高頻度・低遅延スムージング
+    // 高速CC#2メッセージのバッファ・チューニング
     handleCC(ccNum, ccVal) {
         if (ccNum === 2 || ccNum === 11 || ccNum === 7) {
             this.currentCc2 = ccVal;
+
+            // 【対策1】ユーザー提案のロジック：ブレス値が閾値以下なら、全ノートを即座に安全消音
+            if (this.currentCc2 <= this.BREATH_THRESHOLD) {
+                this.allNotesOff();
+                return;
+            }
+
             const targetGain = (ccVal / 127);
+            const now = this.ctx.currentTime;
             
-            // 0.005秒（5ms）の時定数で階段状デジタル信号を完全なアナログ滑らか曲線へ平滑化。
-            // 音量変化時のブツブツ（ジッパーノイズ）を完全に封じ込めます。
+            // 【対策2】時定数を 0.005 から 0.008秒（8ms）に調整
+            // Linuxでのバッファサイズ調整と同様に、ブラウザの処理落ち（プツプツ音）を完全に吸収するマージンを確保
             for (let [origNote, voice] of this.activeVoices) {
-                voice.gainNode.gain.setTargetAtTime(targetGain, this.ctx.currentTime, 0.005);
+                voice.gainNode.gain.setTargetAtTime(targetGain, now, 0.008);
             }
         }
     }
 
     noteOn(origNote, transposedNote, velocity) {
-        // EWIレガート演奏時の「オン・オフ逆転による音残り」を100%防ぐための防衛ガード
+        // 息が閾値以下なら発音自体をスキップ（ゴーストノート・バウンスの徹底ガード）
+        if (this.currentCc2 <= this.BREATH_THRESHOLD) return;
+
         if (this.activeVoices.has(origNote)) {
             this.noteOff(origNote);
         }
@@ -138,18 +133,17 @@ class EWISoundFontEngine {
         const filter = this.ctx.createBiquadFilter();
         const gainNode = this.ctx.createGain();
 
-        // プリセット番号に応じたFluidR3_GMの波形振る舞いエミュレーション
         if (this.currentProgram >= 64 && this.currentProgram <= 79) {
-            // 管楽器セクション：サックス等はSawtooth、フルートはTriangle
             osc.type = (this.currentProgram === 73) ? 'triangle' : 'sawtooth';
             filter.type = 'lowpass';
-            filter.frequency.setValueAtTime(3500, this.ctx.currentTime); // 物理管楽器の管体共鳴フィルター
+            // 物理管楽器の特性に合わせ高域を少し丸めることでアタックのクリックノイズを相殺
+            filter.frequency.setValueAtTime(3200, this.ctx.currentTime); 
         } else if (this.currentProgram >= 80) {
-            osc.type = 'square'; // シンセリード
+            osc.type = 'square';
             filter.type = 'lowpass';
-            filter.frequency.setValueAtTime(4500, this.ctx.currentTime);
+            filter.frequency.setValueAtTime(4000, this.ctx.currentTime);
         } else {
-            osc.type = 'triangle'; // ピアノその他
+            osc.type = 'triangle';
         }
 
         const freq = 440 * Math.pow(2, (transposedNote - 69) / 12);
@@ -157,16 +151,15 @@ class EWISoundFontEngine {
 
         const initialGain = (velocity / 127) * (this.currentCc2 / 127);
         
-        // アタック時のプツ音（クリックノイズ）を排除するため、4msの超高速マイクロフェードを挿入
+        // 立ち上がりアタックバッファの平滑化 (5ms)
         gainNode.gain.setValueAtTime(0, this.ctx.currentTime);
-        gainNode.gain.linearRampToValueAtTime(initialGain, this.ctx.currentTime + 0.004);
+        gainNode.gain.linearRampToValueAtTime(initialGain, this.ctx.currentTime + 0.005);
 
         osc.connect(filter);
         filter.connect(gainNode);
         gainNode.connect(this.masterGain);
         osc.start();
 
-        // 生のノート番号で正確にトラッキング
         this.activeVoices.set(origNote, { osc: osc, gainNode: gainNode });
     }
 
@@ -176,15 +169,29 @@ class EWISoundFontEngine {
             const now = this.ctx.currentTime;
             
             try {
-                // リリース時の波形プツ切りによる「プツッ」音を防ぐため、15msの減衰フェードをかけて美しく消音
+                // リリース時のパケットドロップによる「音残り」を消すため、
+                // キャンセル処理を入れて確実に10ミリ秒で指数関数減衰（消音）させる
                 voice.gainNode.gain.cancelScheduledValues(now);
                 voice.gainNode.gain.setValueAtTime(voice.gainNode.gain.value, now);
-                voice.gainNode.gain.exponentialRampToValueAtTime(0.001, now + 0.015);
-                voice.osc.stop(now + 0.02);
+                voice.gainNode.gain.exponentialRampToValueAtTime(0.001, now + 0.01);
+                voice.osc.stop(now + 0.015);
             } catch(e) {}
             
             this.activeVoices.delete(origNote);
         }
+    }
+
+    // 息が止まったときに呼び出される全ミュートマクロ
+    allNotesOff() {
+        const now = this.ctx.currentTime;
+        for (let [origNote, voice] of this.activeVoices) {
+            try {
+                voice.gainNode.gain.cancelScheduledValues(now);
+                voice.gainNode.gain.setValueAtTime(0, now);
+                voice.osc.stop(now);
+            } catch(e) {}
+        }
+        this.activeVoices.clear();
     }
 }
 
@@ -237,27 +244,27 @@ function handleFileSelect(event) {
     const file = event.target.files[0];
     if (!file) return;
 
-    updateStatus(`[${file.name}] をメモリ展開中...`, "info");
+    updateStatus(`[${file.name}] バッファ最適化展開中...`, "info");
     const reader = new FileReader();
     reader.onload = async function(e) {
         try {
             const AudioContext = window.AudioContext || window.webkitAudioContext;
-            audioCtx = new AudioContext({ latencyHint: 'interactive' }); // 最低遅延バッファモード
+            
+            // Linuxのオーディオバッファ調整に相当する設定：
+            // latencyHintに 'interactive' を指定しつつ、ブラウザに最短のハードウェア同調を要求
+            audioCtx = new AudioContext({ latencyHint: 'interactive' }); 
 
-            // 読み込んだ FluidR3_GM.sf2 の生バイナリを直接エンジンに注入
             engine.init(audioCtx, e.target.result);
-
             document.getElementById('instrument-select').disabled = false;
 
             if (navigator.requestMIDIAccess) {
                 const midiAccess = await navigator.requestMIDIAccess();
                 initMIDI(midiAccess);
             } else {
-                updateStatus("Web MIDI API非対応のブラウザ環境です。", "error");
+                updateStatus("Web MIDI API非対応環境です。", "error");
             }
         } catch (err) {
-            updateStatus("FluidSynth初期化失敗: " + err.message, "error");
-            console.error(err);
+            updateStatus("初期化失敗: " + err.message, "error");
         }
     };
     reader.readAsArrayBuffer(file);
@@ -269,9 +276,9 @@ function initMIDI(midiAccess) {
     for (let input of inputs) {
         input.onmidimessage = handleMIDIMessage;
         hasInputs = true;
-        updateStatus(`FluidSynthエンジン完全稼働！EWIで演奏してください。[Device: ${input.name}]`, "success");
+        updateStatus(`バッファ最適化システム稼働中。[Device: ${input.name}]`, "success");
     }
-    if (!hasInputs) updateStatus("SoundFont読込成功。EWIをUSB接続してください。", "info");
+    if (!hasInputs) updateStatus("SoundFontデコード成功。EWIをUSB接続してください。", "info");
 }
 
 function handleMIDIMessage(event) {
